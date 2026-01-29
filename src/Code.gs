@@ -18,6 +18,15 @@ const CONFIG = {
   CLEAR_COLS: 9,
 
   DATE_TZ: "Asia/Tokyo",
+  COPY_MODE: "sheet", // "sheet" or "range"
+  COPY_FALLBACK_TO_RANGE: true,
+  COPY_COLUMN_WIDTHS: true,
+  COPY_ROW_HEIGHTS: false,
+  COPY_MERGES: true,
+  COPY_BATCH_CELLS: 200000,
+  COPY_BATCH_ROWS: 500,
+  RETRY_MAX: 2,
+  RETRY_BASE_MS: 800,
 };
 
 function onOpen() {
@@ -113,13 +122,8 @@ function runSaveSnapshot() {
         const srcSheet = srcSS.getSheetByName(srcSheetName);
         if (!srcSheet) throw new Error(`コピー対象シートが見つかりません: ${srcSheetName}`);
 
-        // ★最速ルート：
-        // 1) 書式・列幅・結合なども含めてシート丸ごとコピー
-        // 2) “使用範囲だけ”をサーバー側で値化（数式を結果値に）
-        const copied = srcSheet.copyTo(ss);
-        copied.setName(destSheetName);
-
-        valueOnlyByOverwrite_(copied); // ← ここで値貼り付け（高速）
+        // ★スナップショット作成（タイムアウト時は軽量コピーにフォールバック）
+        copySnapshot_(srcSheet, ss, destSheetName);
 
         // 3) 作業シート側のF:N、5行目以降をクリア
         const lastRow = srcSheet.getLastRow();
@@ -133,7 +137,7 @@ function runSaveSnapshot() {
         processed++;
         logRows.push(makeLogRow_(defNo, srcSpreadsheetId, srcSheetName, destSheetName, "OK", "完了"));
       } catch (e) {
-        const message = e && e.message ? e.message : String(e);
+        const message = getErrorMessage_(e);
         errors.push(`定義${defNo}: ${message}`);
         logRows.push(makeLogRow_(defNo, srcSpreadsheetId, srcSheetName, "", "ERROR", message));
       }
@@ -217,8 +221,118 @@ function makeLogRow_(defNo, srcId, srcSheetName, destName, status, message) {
 
 function getSpreadsheetByIdCached_(spreadsheetId, cache) {
   if (cache[spreadsheetId]) return cache[spreadsheetId];
-  cache[spreadsheetId] = SpreadsheetApp.openById(spreadsheetId);
+  cache[spreadsheetId] = retryWithBackoff_(
+    () => SpreadsheetApp.openById(spreadsheetId),
+    CONFIG.RETRY_MAX,
+    CONFIG.RETRY_BASE_MS
+  );
   return cache[spreadsheetId];
+}
+
+function copySnapshot_(srcSheet, destSS, destSheetName) {
+  if (CONFIG.COPY_MODE === "range") {
+    return copyByRange_(srcSheet, destSS, destSheetName);
+  }
+
+  try {
+    return copyBySheet_(srcSheet, destSS, destSheetName);
+  } catch (e) {
+    const message = getErrorMessage_(e);
+    if (CONFIG.COPY_FALLBACK_TO_RANGE && isTimeoutError_(message)) {
+      return copyByRange_(srcSheet, destSS, destSheetName);
+    }
+    throw e;
+  }
+}
+
+function copyBySheet_(srcSheet, destSS, destSheetName) {
+  // 1) 書式・列幅・結合なども含めてシート丸ごとコピー
+  // 2) “使用範囲だけ”をサーバー側で値化（数式を結果値に）
+  const copied = retryWithBackoff_(
+    () => srcSheet.copyTo(destSS),
+    CONFIG.RETRY_MAX,
+    CONFIG.RETRY_BASE_MS
+  );
+  copied.setName(destSheetName);
+  valueOnlyByOverwrite_(copied);
+  return copied;
+}
+
+function copyByRange_(srcSheet, destSS, destSheetName) {
+  const lr = srcSheet.getLastRow();
+  const lc = srcSheet.getLastColumn();
+  const dest = destSS.insertSheet(destSheetName);
+  if (lr <= 0 || lc <= 0) return dest;
+
+  const srcRange = srcSheet.getRange(1, 1, lr, lc);
+  const destRange = dest.getRange(1, 1, lr, lc);
+
+  // 書式を先にコピー（軽量）
+  srcRange.copyTo(destRange, { formatOnly: true });
+
+  // 値のみをコピー（大量セルは分割して転送）
+  copyValuesInBatches_(srcSheet, dest, lr, lc);
+
+  if (CONFIG.COPY_COLUMN_WIDTHS) {
+    for (let c = 1; c <= lc; c++) {
+      dest.setColumnWidth(c, srcSheet.getColumnWidth(c));
+    }
+  }
+  if (CONFIG.COPY_ROW_HEIGHTS) {
+    for (let r = 1; r <= lr; r++) {
+      dest.setRowHeight(r, srcSheet.getRowHeight(r));
+    }
+  }
+  if (CONFIG.COPY_MERGES) {
+    const merges = srcRange.getMergedRanges();
+    merges.forEach(range => {
+      dest.getRange(range.getRow(), range.getColumn(), range.getNumRows(), range.getNumColumns()).merge();
+    });
+  }
+
+  return dest;
+}
+
+function copyValuesInBatches_(srcSheet, destSheet, lr, lc) {
+  const totalCells = lr * lc;
+  if (totalCells <= CONFIG.COPY_BATCH_CELLS) {
+    const values = srcSheet.getRange(1, 1, lr, lc).getValues();
+    destSheet.getRange(1, 1, lr, lc).setValues(values);
+    return;
+  }
+
+  const batchRows = CONFIG.COPY_BATCH_ROWS;
+  for (let r = 1; r <= lr; r += batchRows) {
+    const numRows = Math.min(batchRows, lr - r + 1);
+    const values = srcSheet.getRange(r, 1, numRows, lc).getValues();
+    destSheet.getRange(r, 1, numRows, lc).setValues(values);
+  }
+}
+
+function retryWithBackoff_(fn, maxRetries, baseMs) {
+  let attempt = 0;
+  while (true) {
+    try {
+      return fn();
+    } catch (e) {
+      const message = getErrorMessage_(e);
+      if (attempt >= maxRetries || !isRetryableError_(message)) throw e;
+      Utilities.sleep(baseMs * Math.pow(2, attempt));
+      attempt++;
+    }
+  }
+}
+
+function isRetryableError_(message) {
+  return /timed out|タイムアウト|Service invoked too many times|Rate Limit|internal error/i.test(message);
+}
+
+function isTimeoutError_(message) {
+  return /timed out|タイムアウト/i.test(message);
+}
+
+function getErrorMessage_(e) {
+  return e && e.message ? e.message : String(e);
 }
 
 function runSaveSnapshotConfirm() {
