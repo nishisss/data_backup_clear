@@ -19,6 +19,7 @@ const CONFIG = {
 
   DATE_TZ: "Asia/Tokyo",
   FILE_NAME_DATETIME_FORMAT: "yyyyMMdd_HHmmss",
+  SHOW_SUCCESS_ALERT: true,
   RETRY_MAX: 2,
   RETRY_BASE_MS: 800,
 };
@@ -127,10 +128,11 @@ function runSaveSnapshot() {
         const backupFolder = getFolderByIdCached_(backupFolderId, folderCache);
         const backupFileName = backupSpreadsheetFile_(srcSpreadsheetId, backupFolder);
 
-        clearWorkRange_(srcSheet);
+        const clearedRows = clearWorkRange_(srcSheet);
+        const resultMessage = clearedRows > 0 ? `完了（F:Nを${clearedRows}行クリア）` : "完了（クリア対象なし）";
 
         processed++;
-        logRows.push(makeLogRow_(defNo, srcSpreadsheetId, srcSheetName, backupFileName, "OK", "完了"));
+        logRows.push(makeLogRow_(defNo, srcSpreadsheetId, srcSheetName, backupFileName, "OK", resultMessage));
       } catch (e) {
         const message = getErrorMessage_(e);
         errors.push(`定義${defNo}: ${message}`);
@@ -150,6 +152,8 @@ function runSaveSnapshot() {
       SpreadsheetApp.getUi().alert(
         `一部エラーが発生しました。\n\n${summary}\n\n詳細は「${CONFIG.LOG_SHEET_NAME}」シートを確認してください。`
       );
+    } else if (CONFIG.SHOW_SUCCESS_ALERT) {
+      SpreadsheetApp.getUi().alert(`保存処理が完了しました。\n\n${summary}`);
     }
   } finally {
     lock.releaseLock();
@@ -158,12 +162,14 @@ function runSaveSnapshot() {
 
 function clearWorkRange_(sheet) {
   const lastRow = sheet.getLastRow();
-  if (lastRow < CONFIG.CLEAR_START_ROW) return;
+  if (lastRow < CONFIG.CLEAR_START_ROW) return 0;
 
   const numRows = lastRow - CONFIG.CLEAR_START_ROW + 1;
   sheet
     .getRange(CONFIG.CLEAR_START_ROW, CONFIG.CLEAR_START_COL, numRows, CONFIG.CLEAR_COLS)
     .clearContent();
+  SpreadsheetApp.flush();
+  return numRows;
 }
 
 function backupSpreadsheetFile_(spreadsheetId, folder) {
